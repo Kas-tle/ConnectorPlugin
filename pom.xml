@@ -22,8 +22,8 @@
 
     <repositories>
         <repository>
-            <id>minebench-repo</id>
-            <url>https://repo.minebench.de</url>
+		    <id>jitpack.io</id>
+		    <url>https://jitpack.io</url>
         </repository>
     </repositories>
 
@@ -67,9 +67,9 @@
                 <scope>provided</scope>
             </dependency>
             <dependency>
-                <groupId>de.themoep</groupId>
-                <artifactId>bungeeplugin</artifactId>
-                <version>1.3-SNAPSHOT</version>
+                <groupId>com.github.Phoenix616</groupId>
+                <artifactId>BungeePlugin</artifactId>
+                <version>d76fd620f6</version>
                 <scope>provided</scope>
             </dependency>
             <dependency>
