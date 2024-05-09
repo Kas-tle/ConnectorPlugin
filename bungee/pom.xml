@@ -26,8 +26,9 @@
             <artifactId>bungeecord-api</artifactId>
         </dependency>
         <dependency>
-            <groupId>de.themoep</groupId>
-            <artifactId>bungeeplugin</artifactId>
+            <groupId>com.github.Phoenix616</groupId>
+            <artifactId>BungeePlugin</artifactId>
+            <version>d76fd620f6</version>
         </dependency>
         <dependency>
             <groupId>${groupId}</groupId>
