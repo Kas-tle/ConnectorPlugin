@@ -109,6 +109,7 @@ public class LimboConnectorPlugin extends LimboPlugin implements ConnectorPlugin
 
         bridge = new Bridge(this);
         getLimbo().getEventsManager().registerEvents(this, this);
+        getLimbo().getEventsManager().registerEvents(this, (Listener) bridge);
         getLimbo().getPluginManager().registerCommands(this, new ConnectorCommand(this));
     }
 
