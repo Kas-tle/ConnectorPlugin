@@ -23,7 +23,6 @@ import com.google.common.cache.CacheBuilder;
 import com.google.common.io.ByteArrayDataInput;
 import com.google.common.io.ByteArrayDataOutput;
 import com.google.common.io.ByteStreams;
-import com.loohp.limbo.Limbo;
 import com.loohp.limbo.commands.CommandExecutor;
 import com.loohp.limbo.commands.CommandSender;
 import com.loohp.limbo.commands.TabCompletor;
@@ -35,9 +34,9 @@ import com.loohp.limbo.events.player.PlayerSpawnEvent;
 import com.loohp.limbo.location.Location;
 import com.loohp.limbo.player.Player;
 import com.loohp.limbo.world.World;
-import de.themoep.connectorplugin.BridgeCommon;
 import de.themoep.connectorplugin.LocationInfo;
 import de.themoep.connectorplugin.ResponseHandler;
+import de.themoep.connectorplugin.ServerBridgeCommon;
 import de.themoep.connectorplugin.connector.MessageTarget;
 
 import java.util.ArrayList;
@@ -52,7 +51,7 @@ import java.util.function.Consumer;
 
 import static de.themoep.connectorplugin.connector.Connector.PLAYER_PREFIX;
 
-public class Bridge extends BridgeCommon<LimboConnectorPlugin, Player> implements Listener {
+public class Bridge extends ServerBridgeCommon<LimboConnectorPlugin, Player> implements Listener {
 
     private final Cache<String, LoginRequest> loginRequests = CacheBuilder.newBuilder().expireAfterWrite(1, TimeUnit.MINUTES).build();
 
@@ -60,16 +59,30 @@ public class Bridge extends BridgeCommon<LimboConnectorPlugin, Player> implement
         super(plugin);
         plugin.getLimbo().getEventsManager().registerEvents(plugin, this);
 
-        registerHandler(Action.TELEPORT, (r, data) -> {
-            ByteArrayDataInput in = ByteStreams.newDataInput(data);
+        registerMessageHandler(Action.TELEPORT, (receiver, message) -> {
+            ByteArrayDataInput in = ByteStreams.newDataInput(message.getData());
+            String senderServer = message.getReceivedMessage().getSendingServer();
             long id = in.readLong();
             String playerName = in.readUTF();
             LocationInfo location = LocationInfo.read(in);
+            if (!location.getServer().equals(plugin.getServerName())) {
+                return;
+            }
 
-            Player player = Limbo.getInstance().getPlayer(playerName);
+            World world = plugin.getServer().getWorld(location.getWorld());
+            if (world == null) {
+                sendResponse(plugin.getServerName(), id, false, "No world with the name " + location.getWorld() + " exists on the server!");
+                plugin.logDebug("[M] Player " + playerName + " is online but no world with the name " + location.getWorld() + " to teleport to exists?");
+                return;
+            }
+
+            markTeleporting(playerName);
+
+            Player player = plugin.getServer().getPlayer(playerName);
             if (player != null) {
+                plugin.logDebug("[M] Player " + playerName + " is online. Teleporting to " + location);
                 player.teleport(new Location(
-                        Limbo.getInstance().getWorld(location.getWorld()),
+                        world,
                         location.getX(),
                         location.getY(),
                         location.getZ(),
@@ -77,8 +90,16 @@ public class Bridge extends BridgeCommon<LimboConnectorPlugin, Player> implement
                         location.getPitch()
                 ));
                 sendResponse(plugin.getServerName(), id, true);
+                unmarkTeleporting(playerName);
             } else {
-                sendResponse(plugin.getServerName(), id, false, "Player not found on this server!");
+                loginRequests.put(playerName.toLowerCase(Locale.ROOT), new LocationTeleportRequest(senderServer, id, location));
+                if (!plugin.getConnector().requiresPlayer() || !plugin.getServer().getPlayers().isEmpty()) {
+                    plugin.getBridge().sendToServer(playerName, location.getServer(),
+                            messages -> sendResponseMessage(senderServer, id, messages)
+                    ).whenComplete((success, ex) -> {
+                        sendResponse(senderServer, id, success, success ? "Player teleported!" : "Unable to teleport " + (ex != null ? ex.getMessage() : ""));
+                    });
+                }
             }
         });
 
@@ -228,126 +249,7 @@ public class Bridge extends BridgeCommon<LimboConnectorPlugin, Player> implement
             plugin.getLimbo().getPluginManager().registerCommands(plugin, new BridgedCommandExecutor(senderServer, pluginName, name, description, usage, aliases, permission, permissionMessage));
         });
 
-        registerHandler(Action.RESPONSE, (receiver, data) -> {
-            ByteArrayDataInput in = ByteStreams.newDataInput(data);
-            long id = in.readLong();
-            boolean isCompletion = in.readBoolean();
-            if (isCompletion) {
-                handleResponse(id, in);
-            } else {
-                String message = in.readUTF();
-                Consumer<String>[] consumer = consumers.getIfPresent(id);
-                if (consumer != null) {
-                    for (Consumer<String> stringConsumer : consumer) {
-                        stringConsumer.accept(message);
-                    }
-                }
-            }
-        });
-    }
-
-    /**
-     * Teleport a player to a certain server in the network
-     * @param playerName    The name of the player to send
-     * @param serverName    The name of the server to send to
-     * @param consumer      Details about the sending
-     * @return A future about whether the player could be sent
-     */
-    public CompletableFuture<Boolean> sendToServer(String playerName, String serverName, Consumer<String>... consumer) {
-        CompletableFuture<Boolean> future = new CompletableFuture<>();
-        getServer(playerName).whenComplete((s, e) -> {
-            // check player server existence
-            if (s == null) {
-                future.complete(false);
-                for (Consumer<String> c : consumer) {
-                    c.accept("Player " + playerName + " is not online!");
-                }
-                return;
-            }
-            ByteArrayDataOutput out = ByteStreams.newDataOutput();
-            long id = RANDOM.nextLong();
-            out.writeLong(id);
-            out.writeUTF(playerName);
-            out.writeUTF(serverName);
-            responses.put(id, new ResponseHandler.Boolean(future));
-            consumers.put(id, consumer);
-            sendData(Action.SEND_TO_SERVER, MessageTarget.PROXY, PLAYER_PREFIX + playerName, out.toByteArray());
-        });
-        return future;
-    }
-
-    @Override
-    @SafeVarargs
-    public final CompletableFuture<Boolean> teleport(Player player, LocationInfo location, Consumer<String>... consumer) {
-        return teleport(player.getName(), location, consumer);
-    }
-
-    @Override
-    @SafeVarargs
-    public final CompletableFuture<Boolean> teleport(String playerName, LocationInfo location, Consumer<String>... consumer) {
-        CompletableFuture<Boolean> future = new CompletableFuture<>();
-        ByteArrayDataOutput out = ByteStreams.newDataOutput();
-        long id = RANDOM.nextLong();
-        out.writeLong(id);
-        out.writeUTF(playerName);
-        location.write(out);
-        responses.put(id, new ResponseHandler.Boolean(future));
-        if (consumer != null && consumer.length > 0) {
-            consumers.put(id, consumer);
-        }
-        sendData(Action.TELEPORT, MessageTarget.SERVER, location.getServer(), out.toByteArray());
-        return future;
-    }
-
-    @Override
-    @SafeVarargs
-    public final CompletableFuture<Boolean> teleport(String playerName, String serverName, String worldName, Consumer<String>... consumer) {
-        return teleport(playerName, new LocationInfo(serverName, worldName, 0, 0, 0), consumer);
-    }
-
-    @Override
-    @SafeVarargs
-    public final CompletableFuture<Boolean> teleport(Player player, String serverName, String worldName, Consumer<String>... consumer) {
-        return teleport(player.getName(), serverName, worldName, consumer);
-    }
-
-    @Override
-    @SafeVarargs
-    public final CompletableFuture<Boolean> teleport(Player player, Player target, Consumer<String>... consumer) {
-        return teleport(player.getName(), target.getName(), consumer);
-    }
-
-    @Override
-    @SafeVarargs
-    public final CompletableFuture<Boolean> teleport(String playerName, String targetName, Consumer<String>... consumer) {
-        CompletableFuture<Boolean> future = new CompletableFuture<>();
-        ByteArrayDataOutput out = ByteStreams.newDataOutput();
-        long id = RANDOM.nextLong();
-        out.writeLong(id);
-        out.writeUTF(playerName);
-        out.writeUTF(targetName);
-        responses.put(id, new ResponseHandler.Boolean(future));
-        if (consumer != null && consumer.length > 0) {
-            consumers.put(id, consumer);
-        }
-        sendData(Action.TELEPORT_TO_PLAYER, MessageTarget.SERVER, PLAYER_PREFIX + targetName, out.toByteArray());
-        return future;
-    }
-
-    @Override
-    public CompletableFuture<LocationInfo> getLocation(Player player) {
-        Location loc = player.getLocation();
-        return CompletableFuture.completedFuture(new LocationInfo(plugin.getServerName(), loc.getWorld().getName(), loc.getX(), loc.getY(), loc.getZ(), loc.getYaw(), loc.getPitch()));
-    }
-
-    @Override
-    public CompletableFuture<String> getServer(Player player) {
-        return CompletableFuture.completedFuture(plugin.getServerName());
-    }
-
-    @Override
-    public void sendResponseData(String receiver, byte[] data) {
-        plugin.getConnector().sendData(plugin, Action.RESPONSE, MessageTarget.SERVER, receiver, new BridgeMessage(data).writeToByteArray());
+        this.sendStarted(plugin);
     }
 
     @EventHandler
@@ -356,19 +258,19 @@ public class Bridge extends BridgeCommon<LimboConnectorPlugin, Player> implement
         if (request != null) {
             loginRequests.invalidate(event.getPlayer().getName().toLowerCase(Locale.ROOT));
             if (request instanceof LocationTeleportRequest) {
-                event.setSpawnLocation(adapt(((LocationTeleportRequest) request).location));
-                sendResponse(request.server, request.id, true, "Player login location changed");
-                plugin.logDebug("Set spawn location of player " + event.getPlayer().getName() + " to " + ((LocationTeleportRequest) request).location);
+                event.setSpawnLocation(adapt(((LocationTeleportRequest) request).getLocation()));
+                sendResponse(request.getServer(), request.getId(), true, "Player login location changed");
+                plugin.logDebug("Set spawn location of player " + event.getPlayer().getName() + " to " + ((LocationTeleportRequest) request).getLocation());
             } else if (request instanceof PlayerTeleportRequest) {
-                Player target = plugin.getServer().getPlayer(((PlayerTeleportRequest) request).targetName);
+                Player target = plugin.getServer().getPlayer(((PlayerTeleportRequest) request).getTargetName());
                 if (target == null) {
                     event.setSpawnLocation(plugin.getLimbo().getServerProperties().getWorldSpawn());
-                    sendResponse(request.server, request.id, false, "Target player " + ((PlayerTeleportRequest) request).targetName + " is no longer online?");
-                    plugin.logDebug("Tried to set spawn location of player " + event.getPlayer().getName() + " to " + ((PlayerTeleportRequest) request).targetName + " but target wasn't online. Set to level spawn instead.");
+                    sendResponse(request.getServer(), request.getId(), false, "Target player " + ((PlayerTeleportRequest) request).getTargetName() + " is no longer online?");
+                    plugin.logDebug("Tried to set spawn location of player " + event.getPlayer().getName() + " to " + ((PlayerTeleportRequest) request).getTargetName() + " but target wasn't online. Set to level spawn instead.");
                 } else {
                     event.setSpawnLocation(target.getLocation());
-                    sendResponse(request.server, request.id, true, "Player login location changed to " + target.getName() + "'s location");
-                    plugin.logDebug("Set spawn location of player " + event.getPlayer().getName() + " to " + ((PlayerTeleportRequest) request).targetName + ". " + target.getLocation());
+                    sendResponse(request.getServer(), request.getId(), true, "Player login location changed to " + target.getName() + "'s location");
+                    plugin.logDebug("Set spawn location of player " + event.getPlayer().getName() + " to " + ((PlayerTeleportRequest) request).getTargetName() + ". " + target.getLocation());
                 }
             }
         }
@@ -414,36 +316,6 @@ public class Bridge extends BridgeCommon<LimboConnectorPlugin, Player> implement
         );
     }
 
-    public CompletableFuture<Boolean> runProxyPlayerCommand(Player player, String command) {
-        return runProxyPlayerCommand(player.getName(), command);
-    }
-
-    public CompletableFuture<Boolean> runProxyPlayerCommand(String playerName, String command) {
-        CompletableFuture<Boolean> future = new CompletableFuture<>();
-        ByteArrayDataOutput out = ByteStreams.newDataOutput();
-        long id = RANDOM.nextLong();
-        out.writeLong(id);
-        out.writeUTF(playerName);
-        out.writeUTF(command);
-        responses.put(id, new ResponseHandler.Boolean(future));
-        sendData(Action.PLAYER_COMMAND, MessageTarget.ALL_PROXIES, playerName, out.toByteArray());
-        return future;
-    }
-
-    public CompletableFuture<Boolean> runProxyConsoleCommand(String command, Consumer<String>... consumer) {
-        CompletableFuture<Boolean> future = new CompletableFuture<>();
-        ByteArrayDataOutput out = ByteStreams.newDataOutput();
-        long id = RANDOM.nextLong();
-        out.writeLong(id);
-        out.writeUTF(command);
-        responses.put(id, new ResponseHandler.Boolean(future));
-        if (consumer != null && consumer.length > 0) {
-            consumers.put(id, consumer);
-        }
-        sendData(Action.CONSOLE_COMMAND, MessageTarget.ALL_PROXIES, out.toByteArray());
-        return future;
-    }
-
     private void sendCommandExecution(CommandSender sender, BridgedCommandExecutor executor, String label, String[] args) {
         ByteArrayDataOutput out = ByteStreams.newDataOutput();
         out.writeUTF(executor.getServer());
@@ -465,32 +337,181 @@ public class Bridge extends BridgeCommon<LimboConnectorPlugin, Player> implement
         }
     }
 
-    private static class LoginRequest {
-        private final String server;
-        private final long id;
-
-        private LoginRequest(String server, long id) {
-            this.server = server;
-            this.id = id;
-        }
+    @Override
+    @SafeVarargs
+    public final CompletableFuture<Boolean> teleport(Player player, LocationInfo location, Consumer<String>... consumer) {
+        return teleport(player.getName(), location, consumer);
     }
 
-    private static class LocationTeleportRequest extends LoginRequest {
-        private final LocationInfo location;
-
-        public LocationTeleportRequest(String server, long id, LocationInfo location) {
-            super(server, id);
-            this.location = location;
+    @Override
+    @SafeVarargs
+    public final CompletableFuture<Boolean> teleport(String playerName, LocationInfo location, Consumer<String>... consumer) {
+        markTeleporting(playerName);
+        if (location.getServer().equals(plugin.getServerName())) {
+            Player player = plugin.getServer().getPlayer(playerName);
+            if (player != null) {
+                plugin.logDebug("Player " + playerName + " is online. Teleporting to " + location);
+                player.teleport(adapt(location));
+                plugin.logDebug("Teleport of player " + playerName + " was successful");
+                unmarkTeleporting(playerName);
+                return CompletableFuture.completedFuture(true);
+            }
         }
+        CompletableFuture<Boolean> future = new CompletableFuture<>();
+        getServer(playerName).whenComplete((s, e) -> {
+            // check player server existence
+            if (s == null) {
+                future.complete(false);
+                for (Consumer<String> c : consumer) {
+                    c.accept("Player " + playerName + " is not online!");
+                }
+                return;
+            }
+            ByteArrayDataOutput out = ByteStreams.newDataOutput();
+            long id = RANDOM.nextLong();
+            out.writeLong(id);
+            out.writeUTF(playerName);
+            location.write(out);
+            responses.put(id, new ResponseHandler.Boolean(future));
+            if (consumer != null && consumer.length > 0) {
+                consumers.put(id, consumer);
+            }
+            sendData(Action.TELEPORT, MessageTarget.SERVER, location.getServer(), out.toByteArray());
+        });
+        return future;
     }
 
-    private static class PlayerTeleportRequest extends LoginRequest {
-        private final String targetName;
+    @Override
+    @SafeVarargs
+    public final CompletableFuture<Boolean> teleport(Player player, String serverName, String worldName, Consumer<String>... consumer) {
+        return teleport(player.getName(), serverName, worldName, consumer);
+    }
 
-        public PlayerTeleportRequest(String server, long id, String targetName) {
-            super(server, id);
-            this.targetName = targetName;
+    @Override
+    @SafeVarargs
+    public final CompletableFuture<Boolean> teleport(String playerName, String serverName, String worldName, Consumer<String>... consumer) {
+        markTeleporting(playerName);
+        if (serverName.equals(plugin.getServerName())) {
+            Player player = plugin.getServer().getPlayer(playerName);
+            if (player != null) {
+                World world = plugin.getServer().getWorld(worldName);
+                if (world == null) {
+                    plugin.logDebug("Player " + playerName + " is online but no world with the name " + worldName + " to teleport to exists?");
+                    for (Consumer<String> c : consumer) {
+                        c.accept("No world with the name " + worldName + " exists on the server!");
+                    }
+                    unmarkTeleporting(playerName);
+                    return CompletableFuture.completedFuture(false);
+                }
+                plugin.logDebug("Player " + playerName + " is online. Teleporting to spawn of world " + worldName);
+                player.teleport(plugin.getLimbo().getServerProperties().getWorldSpawn());
+                plugin.logDebug("Teleport of player " + playerName + " was successful");
+                unmarkTeleporting(playerName);
+                return CompletableFuture.completedFuture(true);
+            }
         }
+
+        CompletableFuture<Boolean> future = new CompletableFuture<>();
+        getServer(playerName).whenComplete((s, e) -> {
+            // check player server existence
+            if (s == null) {
+                future.complete(false);
+                for (Consumer<String> c : consumer) {
+                    c.accept("Player " + playerName + " is not online!");
+                }
+                return;
+            }
+            ByteArrayDataOutput out = ByteStreams.newDataOutput();
+            long id = RANDOM.nextLong();
+            out.writeLong(id);
+            out.writeUTF(playerName);
+            out.writeUTF(serverName);
+            out.writeUTF(worldName);
+            responses.put(id, new ResponseHandler.Boolean(future));
+            consumers.put(id, consumer);
+            sendData(Action.TELEPORT_TO_WORLD, MessageTarget.PROXY, PLAYER_PREFIX + playerName, out.toByteArray());
+        });
+        return future;
+    }
+
+    @Override
+    @SafeVarargs
+    public final CompletableFuture<Boolean> teleport(Player player, Player target, Consumer<String>... consumer) {
+        return teleport(player.getName(), target.getName(), consumer);
+    }
+
+    @Override
+    @SafeVarargs
+    public final CompletableFuture<Boolean> teleport(String playerName, String targetName, Consumer<String>... consumer) {
+        CompletableFuture<Boolean> future = new CompletableFuture<>();
+        getServer(playerName).whenComplete((server, ex) -> {
+            if (server == null) {
+                future.complete(false);
+                for (Consumer<String> c : consumer) {
+                    c.accept("Player " + playerName + " is not online!");
+                }
+                return;
+            }
+            markTeleporting(playerName);
+            ByteArrayDataOutput out = ByteStreams.newDataOutput();
+            long id = RANDOM.nextLong();
+            out.writeLong(id);
+            out.writeUTF(playerName);
+            out.writeUTF(targetName);
+            responses.put(id, new ResponseHandler.Boolean(future));
+            if (consumer != null && consumer.length > 0) {
+                consumers.put(id, consumer);
+            }
+            sendData(Action.TELEPORT_TO_PLAYER, MessageTarget.SERVER, PLAYER_PREFIX + targetName, out.toByteArray());
+        });
+        return future;
+    }
+
+    /**
+     * Get the server a player is connected to
+     * @param player    The player to get the server for
+     * @return A future for when the server was queried
+     */
+    public CompletableFuture<String> getServer(Player player) {
+        return getServer(player.getName());
+    }
+
+    /**
+     * Get the location a player is connected to
+     * @param player    The player to get the location for
+     * @return A future for when the location was queried
+     */
+    public CompletableFuture<LocationInfo> getLocation(Player player) {
+        return getLocation(player.getName());
+    }
+
+    /**
+     * Run a command for a player on the proxy they are connected to.
+     * The player needs to have access to that command!
+     * @param player    The player to run the command for
+     * @param command   The command to run
+     * @return A future for whether the command was run successfully
+     */
+    public CompletableFuture<Boolean> runProxyPlayerCommand(Player player, String command) {
+        CompletableFuture<Boolean> future = new CompletableFuture<>();
+        // Make sure target player is connected
+        getServer(player).whenComplete((s, e) -> {
+            // check player server existence
+            if (s == null) {
+                future.complete(false);
+                return;
+            }
+            ByteArrayDataOutput out = ByteStreams.newDataOutput();
+            long id = RANDOM.nextLong();
+            out.writeLong(id);
+            out.writeUTF(player.getName());
+            out.writeLong(player.getUniqueId().getMostSignificantBits());
+            out.writeLong(player.getUniqueId().getLeastSignificantBits());
+            out.writeUTF(command);
+            responses.put(id, new ResponseHandler.Boolean(future));
+            sendData(Action.PLAYER_COMMAND, MessageTarget.PROXY, player, out.toByteArray());
+        });
+        return future;
     }
 
     private class BridgedCommandExecutor implements CommandExecutor, TabCompletor {
